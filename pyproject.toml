@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legislink"
+version = "0.1.0"
+description = "Extract, resolve and link UK legislation citations to legislation.gov.uk"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# The core library and CLI deliberately have no required dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+fuzzy = ["rapidfuzz>=3.6"]
+remote = ["httpx>=0.27"]
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+dev = ["pytest>=8.0", "rapidfuzz>=3.6", "httpx>=0.27", "fastapi>=0.110", "uvicorn[standard]>=0.29"]
+
+[project.scripts]
+legislink = "legislink.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["legislink*"]
+
+[tool.setuptools.package-data]
+legislink = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

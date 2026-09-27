@@ -1,0 +1,17 @@
+
+[api]
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+[dev]
+pytest>=8.0
+rapidfuzz>=3.6
+httpx>=0.27
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+[fuzzy]
+rapidfuzz>=3.6
+
+[remote]
+httpx>=0.27
