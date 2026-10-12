@@ -1,0 +1,18 @@
+{
+  "_comment": "Seed case registry. Extend with your own file via LEGISLINK_CASES or CaseRegistry.load_file(). Every neutral citation here was checked against Find Case Law (scripts/verify_cases.py). Report citations cannot be checked against a free authoritative source, so the resolver cross-checks them against the cited case name.",
+  "cases": [
+    {"name": "R (Miller) v Prime Minister", "neutral": "[2019] UKSC 41", "reports": ["[2020] AC 373"],
+     "aliases": ["Cherry v Advocate General for Scotland"]},
+    {"name": "R (Miller) v Secretary of State for Exiting the European Union", "neutral": "[2017] UKSC 5",
+     "reports": ["[2018] AC 61"]},
+    {"name": "Montgomery v Lanarkshire Health Board", "neutral": "[2015] UKSC 11", "reports": ["[2015] AC 1430"]},
+    {"name": "Uber BV v Aslam", "neutral": "[2021] UKSC 5", "reports": ["[2021] ICR 657"]},
+    {"name": "Patel v Mirza", "neutral": "[2016] UKSC 42", "reports": ["[2017] AC 467"]},
+    {"name": "R (UNISON) v Lord Chancellor", "neutral": "[2017] UKSC 51", "reports": ["[2020] AC 869"]},
+    {"name": "Robinson v Chief Constable of West Yorkshire Police", "neutral": "[2018] UKSC 4",
+     "reports": ["[2018] AC 736"]},
+    {"name": "Pimlico Plumbers Ltd v Smith", "neutral": "[2018] UKSC 29", "reports": ["[2018] ICR 1511"]},
+    {"name": "Essop v Home Office", "neutral": "[2017] UKSC 27", "reports": ["[2017] 1 WLR 1343", "[2017] ICR 640"]},
+    {"name": "Lachaux v Independent Print Ltd", "neutral": "[2019] UKSC 27", "reports": ["[2020] AC 612"]}
+  ]
+}

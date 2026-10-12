@@ -1,4 +1,7 @@
-"""High-level entry points: resolve a document, annotate it, index a corpus."""
+"""High-level entry points: resolve a document, annotate it, index a corpus.
+
+Each works over both legislation citations and case citations.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +9,7 @@ import html as _html
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .models import Citation, DocumentResult, Version
+from .models import CaseCitation, Citation, DocumentResult, Version
 from .registry import Registry
 from .resolve import Resolver
 
@@ -47,7 +50,7 @@ def annotate(
     pieces: list[str] = []
     cursor = 0
     text = result.text
-    for citation in sorted(result.citations, key=lambda c: c.start):
+    for citation in sorted([*result.citations, *result.cases], key=lambda c: c.start):
         if citation.start < cursor:
             continue  # overlapping match already consumed
         pieces.append(_escape(text[cursor: citation.start], fmt))
@@ -65,8 +68,11 @@ def _escape(text: str, fmt: str) -> str:
     return _html.escape(text) if fmt == "html" else text
 
 
-def _link(surface: str, citation: Citation, fmt: str) -> str:
-    title = citation.work.citation if citation.work else "unresolved"
+def _link(surface: str, citation: Citation | CaseCitation, fmt: str) -> str:
+    if isinstance(citation, CaseCitation):
+        title = citation.case.citation if citation.case else "unresolved"
+    else:
+        title = citation.work.citation if citation.work else "unresolved"
     if fmt == "html":
         return (
             f'<a href="{_html.escape(citation.url or "", quote=True)}"'
@@ -97,12 +103,14 @@ def build_index(
     """Resolve a corpus and return a work-centric index.
 
     The index answers the question a citator is actually for: *which documents
-    cite this piece of legislation, and at what pinpoint?*
+    cite this piece of legislation, or this case, and at what pinpoint?*
     """
     resolver = resolver or default_resolver()
     works: dict[str, dict] = {}
+    cases: dict[str, dict] = {}
     documents: list[dict] = []
     unresolved: dict[str, int] = {}
+    unresolved_cases: dict[str, int] = {}
 
     for path, text in iter_documents(paths):
         result = resolver.resolve_document(text)
@@ -112,6 +120,9 @@ def build_index(
                 "citations": len(result.citations),
                 "resolved": result.resolved_count,
                 "works": [w.id for w in result.works()],
+                "case_citations": len(result.cases),
+                "cases_resolved": sum(1 for c in result.cases if c.resolved),
+                "cases": [c.id for c in result.distinct_cases()],
             }
         )
         for citation in result.citations:
@@ -128,6 +139,20 @@ def build_index(
             label = ", ".join(p.label for p in citation.provisions) or "(whole work)"
             if label not in pinpoints:
                 pinpoints.append(label)
+        for case_citation in result.cases:
+            if case_citation.case is None:
+                key = case_citation.case_ref.name or " ".join(case_citation.surface.split())
+                unresolved_cases[key] = unresolved_cases.get(key, 0) + 1
+                continue
+            entry = cases.setdefault(
+                case_citation.case.id,
+                {**case_citation.case.to_dict(), "mentions": 0, "cited_by": {}},
+            )
+            entry["mentions"] += 1
+            pinpoints = entry["cited_by"].setdefault(str(path), [])
+            label = case_citation.case_ref.pinpoint or "(whole judgment)"
+            if label not in pinpoints:
+                pinpoints.append(label)
 
     return {
         "documents": documents,
@@ -136,10 +161,18 @@ def build_index(
             ({"reference": k, "count": v} for k, v in unresolved.items()),
             key=lambda u: -u["count"],
         ),
+        "cases": sorted(cases.values(), key=lambda c: -c["mentions"]),
+        "unresolved_cases": sorted(
+            ({"reference": k, "count": v} for k, v in unresolved_cases.items()),
+            key=lambda u: -u["count"],
+        ),
         "stats": {
             "documents": len(documents),
             "distinct_works": len(works),
             "total_citations": sum(d["citations"] for d in documents),
             "resolved_citations": sum(d["resolved"] for d in documents),
+            "distinct_cases": len(cases),
+            "total_case_citations": sum(d["case_citations"] for d in documents),
+            "resolved_case_citations": sum(d["cases_resolved"] for d in documents),
         },
     }

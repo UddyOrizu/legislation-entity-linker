@@ -68,6 +68,27 @@ def normalize_alias(alias: str) -> str:
     return _DROP.sub("", text)
 
 
+# Words that vary between reports of the same case without changing which case
+# it is: "Uber BV and others v Aslam and others" is "Uber v Aslam".
+_CASE_NOISE = re.compile(
+    r"\b(?:on the application of|and others|and another|ors|anor|the|ltd|limited|"
+    r"plc|llp|bv|nv|ag|gmbh|inc)\b"
+)
+
+
+def normalize_case_name(name: str) -> str:
+    """Fold a case name to its comparison key.
+
+    ``"R (on the application of Miller) v The Prime Minister"`` ->
+    ``"r miller v prime minister"``.
+    """
+    text = clean(name).lower().replace("&", " and ")
+    text = re.sub(r"\bvs?\.?(?=\s)", " v ", text)
+    text = _DROP.sub(" ", text)
+    text = _CASE_NOISE.sub(" ", text)
+    return _WS.sub(" ", text).strip()
+
+
 try:  # pragma: no cover - depends on whether the optional extra is installed
     from rapidfuzz import fuzz as _fuzz
 

@@ -182,3 +182,133 @@ NESTING_JOIN_RE = re.compile(r"^\s*(?:of|to|in)\s+(?:the\s+)?$", re.IGNORECASE)
 def canonical_kind(raw: str) -> str:
     """Map a matched kind token to its canonical name."""
     return _KIND_ALIASES[raw.lower().rstrip(".")]
+
+
+# --------------------------------------------------------------------------
+# Case law
+# --------------------------------------------------------------------------
+#
+#     [2019] UKSC 41                            neutral citation
+#     [2019] EWHC 123 (Ch)                      with a division
+#     [2020] AC 373 / [2004] 2 AC 557           law report, optional volume
+#     (2002) 35 EHRR 1                          round-bracket report
+#     Donoghue v Stevenson / R (Miller) v PM    case names
+#     Re B (A Child)                            "Re" cases
+#     at [45] / at paras 45-48 / at 567         pinpoints
+
+# Court codes as they appear in neutral citations. Longest-first so that
+# "EWCA Civ" is tried before a bare prefix could match.
+_NEUTRAL_COURTS = (
+    r"EWCA\s+Civ|EWCA\s+Crim|UKSC|UKPC|UKHL|EWHC|EWFC|EWCOP|EWCC|EWCR|UKUT|UKFTT|"
+    r"UKEATS?|EAT|UKIPTrib|CSIH|CSOH|HCJAC|NICA|NIQB|NIKB|NICh|NIFam"
+)
+
+NEUTRAL_RE = re.compile(
+    rf"""
+    \[(?P<year>{_YEAR})\]\s+
+    (?P<court>{_NEUTRAL_COURTS})\s+
+    (?P<number>\d+(?:_\d+_\d+)?)\b         # UKEAT numbers look like 0123_16_1234
+    (?:\s*\(\s*(?P<division>[A-Za-z][A-Za-z0-9]{{0,11}})\s*\))?
+    """,
+    re.VERBOSE,
+)
+
+# Law report series. A report citation is only recognised for a series named
+# here: "[2004] 2 XYZ 557" is far more often noise than an obscure report.
+_REPORT_SERIES = (
+    "AC", "QB", "KB", "Ch", "Fam", "P", "WLR", "All ER", "All ER (Comm)",
+    "All ER (D)", "ICR", "IRLR", "Cr App R", "Cr App R (S)", "Lloyd's Rep",
+    "Lloyd’s Rep", "BCLC", "BCC", "EMLR", "FSR", "RPC", "HRLR", "UKHRR",
+    "EHRR", "BHRC", "BMLR", "Med LR", "Lloyd's Rep Med", "PIQR", "EG", "EGLR",
+    "P & CR", "HLR", "FLR", "FCR", "STC", "Imm AR", "INLR", "LGR", "ACD",
+    "JPL", "Env LR", "CMLR", "SC", "SLT", "NI", "App Cas", "QBD", "Ch D",
+    "PD", "Cl & F", "HL Cas", "TLR", "LT", "LJKB", "LJQB", "Costs LR", "BLR",
+    "Con LR", "PNLR", "Pens LR", "TC", "SFTD",
+)
+_SERIES_ALT = "|".join(
+    re.escape(s).replace(r"\ ", r"\s+")
+    for s in sorted(_REPORT_SERIES, key=len, reverse=True)
+)
+
+REPORT_RE = re.compile(
+    rf"""
+    (?P<open>[\[(])(?P<year>{_YEAR})[\])]\s+
+    (?:(?P<volume>\d{{1,3}})\s+)?
+    (?P<series>{_SERIES_ALT})\s+
+    (?P<page>\d{{1,5}})\b
+    """,
+    re.VERBOSE,
+)
+
+# Between parallel citations of one case: "[2019] UKSC 41, [2020] AC 373".
+CASE_CITE_JOIN_RE = re.compile(r"^\s*[,;]?\s*$")
+
+# A pinpoint straight after a citation: "at [45]", "at paras 45-48", "at 567B".
+# Used with .match(text, pos), so it is anchored without a "^".
+CASE_PINPOINT_RE = re.compile(
+    r"""\s*,?\s*at\s+
+    (?P<pin>
+        \[\d+\](?:\s*[-–]\s*\[\d+\])?
+      | paras?\.?\s*\d+(?:\s*[-–]\s*\d+)?
+      | pp?\.?\s*\d+(?:\s*[-–]\s*\d+)?
+      | \d+[A-H]?(?:\s*[-–]\s*\d+[A-H]?)?
+    )""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+# A party: capitalised words, parenthesised qualifiers ("(Miller)", "(on the
+# application of Miller)", "(A Child)") and the lowercase words that occur
+# inside real party names. "in", "on" and a bare "the" are excluded because
+# they let a name run on into the surrounding sentence. A trailing comma is
+# allowed for "R v Secretary of State for the Home Department, ex p Brind".
+_PARTY_TOKEN = r"(?:[A-Z][\w'’.\-]*,?|\([^()\n]{1,80}\),?|&)"
+_PARTY_CONNECTOR = (
+    r"(?:of\s+the|for\s+the|and\s+(?:others|another|ors|anor)|plc|ltd|llp|of|for|and|de|du|da|van|von|der|le|la|upon|ex\s+p(?:arte)?\.?)"
+)
+_PARTY = rf"{_PARTY_TOKEN}(?:[ \t]*\n?[ \t]*(?:{_PARTY_TOKEN}|{_PARTY_CONNECTOR})){{0,14}}"
+
+CASE_NAME_RE = re.compile(
+    rf"""
+    (?<![\w(])
+    (?P<name>
+        {_PARTY}\s+v\.?\s+{_PARTY}
+      | (?:In\s+)?[Rr]e\s+{_PARTY}
+    )
+    """,
+    re.VERBOSE,
+)
+
+# Sentence-initial words a name match can sweep up: "In Smith v Jones" ->
+# "Smith v Jones".
+CASE_NAME_LEADERS = frozenset({
+    "In", "See", "Applying", "Applied", "Following", "Followed", "Per", "Cf",
+    "But", "And", "As", "Also", "Under", "After", "Unlike", "Like",
+    "Contrast", "Compare", "Then", "Thus", "So", "Since", "Because",
+    "Although", "While", "Whereas", "Citing", "Approving", "Distinguishing",
+    "Overruling", "Affirming", "Reversing", "Considering", "The", "This",
+    "That", "On", "At", "For", "By", "From", "With", "Of", "It", "Here",
+    "There", "However", "Moreover", "Further", "Furthermore", "Similarly",
+    "Accordingly", "Indeed", "Notably", "Note", "Where", "When", "If",
+})
+
+#: Lowercase words that cannot end a party name, trimmed from a match.
+CASE_NAME_TRAILERS = frozenset({
+    "of", "for", "and", "de", "du", "da", "van", "von", "der", "le", "la",
+    "upon", "ex", "p", "p.", "parte", "the",
+})
+
+# The same name, anchored to the end of the text before a citation:
+# "...as held in Patel v Mirza, " + "[2016] UKSC 42".
+CASE_NAME_TAIL_RE = re.compile(
+    CASE_NAME_RE.pattern + r"[ \t,]*\n?[ \t]*$", re.VERBOSE
+)
+
+# Where a case name cannot reach back past. Full stops inside names ("ex p.",
+# "Ltd.", "Co.", "No.", initials such as "J. Smith") are not boundaries.
+SENTENCE_END_RE = re.compile(
+    r"(?<!\bp)(?<!\bLtd)(?<!\bCo)(?<!\bNo)(?<!\b[A-Z])[.!?;:](?=\s)|\n[ \t]*\n"
+)
+
+# A " v " joining two parties, for finding registered case names in prose.
+CASE_V_RE = re.compile(r"\s+v\.?\s+")
+CASE_RE_RE = re.compile(r"\b[Rr]e\s+")

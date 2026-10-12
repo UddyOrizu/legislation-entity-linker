@@ -1,4 +1,4 @@
-"""Pass 1: find citations in text.
+"""Pass 1: find legislation and case citations in text.
 
 Extraction is deliberately resolution-free -- it reports *what the text says*,
 including references it cannot pin down ("the Act"), and leaves matching
@@ -9,10 +9,13 @@ rewrite the original document.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 
-from .models import Provision, WorkRef
-from .normalize import normalize_alias
+from .cases import report_from_match
+from .courts import make_neutral
+from .models import CaseRef, Provision, ReportCitation, WorkRef, NeutralCitation
+from .normalize import normalize_alias, normalize_case_name
 from . import patterns as P
 
 
@@ -321,8 +324,202 @@ def bind(
     return sorted(citations, key=lambda c: (c.start, c.end))
 
 
+# --------------------------------------------------------------------------
+# Case law
+# --------------------------------------------------------------------------
+
+@dataclass
+class CaseMention:
+    """A reference to a case, before resolution."""
+
+    ref: CaseRef
+    start: int
+    end: int
+
+
+def _case_tokens(text: str) -> list[tuple[int, int, NeutralCitation | ReportCitation]]:
+    tokens: list[tuple[int, int, NeutralCitation | ReportCitation]] = []
+    for m in P.NEUTRAL_RE.finditer(text):
+        neutral = make_neutral(
+            m.group("year"), m.group("court"), m.group("number"), m.group("division")
+        )
+        tokens.append((m.start(), m.end(), neutral))
+    spans = [(s, e) for s, e, _ in tokens]
+    for m in P.REPORT_RE.finditer(text):
+        if not _overlaps(m.start(), m.end(), spans):
+            tokens.append((m.start(), m.end(), report_from_match(m)))
+    return sorted(tokens, key=lambda t: t[0])
+
+
+def _clusters(text: str, tokens: list) -> list[list]:
+    """Group parallel citations of one case: ``[2019] UKSC 41, [2020] AC 373``.
+
+    A cluster holds at most one neutral citation; a second one starts a new
+    case, since it is almost always a different court's judgment in the same
+    litigation.
+    """
+    clusters: list[list] = []
+    for token in tokens:
+        if clusters:
+            last = clusters[-1]
+            gap = text[last[-1][1]: token[0]]
+            has_neutral = any(isinstance(t[2], NeutralCitation) for t in last)
+            if (
+                P.CASE_CITE_JOIN_RE.match(gap)
+                and gap.count("\n") <= 1
+                and not (has_neutral and isinstance(token[2], NeutralCitation))
+            ):
+                last.append(token)
+                continue
+        clusters.append([token])
+    return clusters
+
+
+def _sentence_start(text: str, lo: int, hi: int) -> int:
+    """Offset just after the last sentence boundary in ``text[lo:hi]``."""
+    start = lo
+    for m in P.SENTENCE_END_RE.finditer(text, lo, hi):
+        start = m.end()
+    return start
+
+
+def _clean_name(raw: str, offset: int) -> tuple[str, int] | None:
+    """Strip sentence words swept into a name match; return (name, start).
+
+    A leading "In" always goes, so "In re Hallett's Estate" and "Re Hallett's
+    Estate" come out the same.
+    """
+    tokens = [(m.group(0), m.start()) for m in re.finditer(r"\S+", raw)]
+    while tokens and tokens[0][0] in P.CASE_NAME_LEADERS:
+        tokens.pop(0)
+    while tokens and tokens[-1][0].rstrip(",").lower() in P.CASE_NAME_TRAILERS:
+        tokens.pop()
+    if not tokens:
+        return None
+    start = tokens[0][1]
+    end = tokens[-1][1] + len(tokens[-1][0])
+    name = " ".join(raw[start:end].split()).rstrip(",")
+    words = name.split()
+    if "v" not in words and "v." not in words and words[0] not in ("Re", "re"):
+        return None
+    if words[0] in ("v", "v."):
+        return None
+    return name, offset + start
+
+
+def find_cases(text: str, known_names: set[str] | None = None) -> list[CaseMention]:
+    """Find case citations.
+
+    Two forms are recognised:
+
+    * a citation cluster -- one or more neutral or law report citations,
+      optionally preceded by the case name and followed by a pinpoint:
+      ``Patel v Mirza [2016] UKSC 42, [2017] AC 467 at [120]``;
+    * a case cited by name alone (``in Patel v Mirza``), but only when the
+      name is in ``known_names``. Without that gate every "X v Y" in prose
+      would be reported, and most of them could never be linked.
+    """
+    mentions: list[CaseMention] = []
+    previous_end = 0
+
+    for cluster in _clusters(text, _case_tokens(text)):
+        start, end = cluster[0][0], cluster[-1][1]
+
+        pinpoint = None
+        pm = P.CASE_PINPOINT_RE.match(text, end)
+        if pm:
+            pinpoint = " ".join(pm.group("pin").split())
+            end = pm.end()
+
+        name = None
+        lo = _sentence_start(text, max(previous_end, start - 250), start)
+        nm = P.CASE_NAME_TAIL_RE.search(text[lo:start])
+        if nm:
+            cleaned = _clean_name(nm.group("name"), lo + nm.start("name"))
+            if cleaned:
+                name, start = cleaned
+
+        neutral = next((t[2] for t in cluster if isinstance(t[2], NeutralCitation)), None)
+        reports = tuple(t[2] for t in cluster if isinstance(t[2], ReportCitation))
+        ref = CaseRef(
+            surface=text[start:end], name=name, neutral=neutral,
+            reports=reports, pinpoint=pinpoint,
+        )
+        mentions.append(CaseMention(ref=ref, start=start, end=end))
+        previous_end = end
+
+    if known_names:
+        taken = [(m.start, m.end) for m in mentions]
+        for found in _find_known_names(text, known_names, taken):
+            mentions.append(found)
+            taken.append((found.start, found.end))
+
+    return sorted(mentions, key=lambda m: m.start)
+
+
+def _party_edge(ch: str) -> bool:
+    """Can a party name start (or its last word begin) with this character?"""
+    return ch.isupper() or ch.isdigit() or ch == "("
+
+
+def _find_known_names(
+    text: str, known: set[str], taken: list[tuple[int, int]]
+) -> list[CaseMention]:
+    """Find registered case names cited without a citation.
+
+    Every " v " (and every "Re") is a pivot. Words either side of it are tried
+    in every combination, and the longest combination that normalises to a
+    known name wins. That is robust to the leading and trailing prose a regex
+    would sweep up ("Following Patel v Mirza and Montgomery v ...").
+    """
+    out: list[CaseMention] = []
+    pivots = [(m.start(), m.end(), True) for m in P.CASE_V_RE.finditer(text)]
+    pivots += [(m.start(), m.end(), False) for m in P.CASE_RE_RE.finditer(text)]
+
+    for p_start, p_end, has_left in sorted(pivots):
+        if _overlaps(p_start, p_end, taken):
+            continue
+        hi = min(len(text), p_end + 200)
+        right_end = next((m.start() for m in P.SENTENCE_END_RE.finditer(text, p_end, hi)), hi)
+        right = list(re.finditer(r"\S+", text[p_end:right_end]))[:15]
+
+        if has_left:
+            lo = _sentence_start(text, max(0, p_start - 200), p_start)
+            lefts = [lo + m.start() for m in re.finditer(r"\S+", text[lo:p_start])][-15:]
+        else:
+            lefts = [p_start]
+
+        best: tuple[int, int] | None = None
+        for left_start in lefts:
+            for r in right:
+                end = p_end + r.end()
+                while end > p_end and text[end - 1] in ",.;:":
+                    end -= 1
+                # A name starts and ends on a party word, never on prose that
+                # normalisation happens to discard ("..., the").
+                last_word = r.group(0).rstrip(",.;:")
+                if not (_party_edge(text[left_start]) and (
+                    _party_edge(last_word[0]) or last_word in ("others", "another")
+                )):
+                    continue
+                if normalize_case_name(text[left_start:end]) not in known:
+                    continue
+                if best is None or end - left_start > best[1] - best[0]:
+                    best = (left_start, end)
+
+        if best and not _overlaps(best[0], best[1], taken + [(m.start, m.end) for m in out]):
+            surface = text[best[0]: best[1]]
+            out.append(CaseMention(
+                ref=CaseRef(surface=surface, name=" ".join(surface.split())),
+                start=best[0], end=best[1],
+            ))
+    return out
+
+
 def extract(
-    text: str, known_short_forms: set[str] | None = None
+    text: str,
+    known_short_forms: set[str] | None = None,
+    exclude: list[tuple[int, int]] | None = None,
 ) -> tuple[list[RawCitation], dict[str, Mention]]:
     """Run the full extraction pass.
 
@@ -330,11 +527,16 @@ def extract(
     as citations even when the document never defines them -- the resolver
     passes its registry's aliases, which is how "under TUPE" is recognised.
 
+    ``exclude`` lists spans that are already accounted for -- the resolver
+    passes case citations, so that "[1996] Ch 1" is not read as Chapter 1 and
+    "at para 45" of a judgment is not read as a paragraph of legislation.
+
     Returns the raw citations in document order and the short-form definitions
     discovered along the way (``"DPA 2018"`` -> the mention that defined it).
     """
-    works = find_works(text)
-    taken = [(m.start, m.end) for m in works]
+    exclude = list(exclude or ())
+    works = [m for m in find_works(text) if not _overlaps(m.start, m.end, exclude)]
+    taken = exclude + [(m.start, m.end) for m in works]
 
     instruments = find_bare_instruments(text, taken)
     taken += [(m.start, m.end) for m in instruments]

@@ -1,4 +1,4 @@
-"""Pass 2: resolve extracted references to canonical works.
+"""Pass 2: resolve extracted references to canonical works and cases.
 
 Resolution is ordered by how much evidence each strategy needs, strongest
 first: an official number is decisive, an exact title is near-decisive, a
@@ -14,10 +14,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .extract import Mention, RawCitation, extract
+from .cases import CaseRegistry
+from .courts import COURTS, case_id, judgment_url, search_url as case_search_url
+from .extract import CaseMention, Mention, RawCitation, extract, find_cases
 from .link import build as build_links
-from .models import CanonicalWork, Citation, DocumentResult, Version, WorkRef
-from .normalize import normalize_alias, normalize_title
+from .models import (
+    CanonicalCase, CanonicalWork, CaseCitation, CaseRef, Citation, DocumentResult,
+    Version, WorkRef,
+)
+from .normalize import normalize_alias, normalize_case_name, normalize_title, similarity
 from .registry import Registry, make_id
 
 #: Document types that count as primary legislation for "the Act".
@@ -87,6 +92,21 @@ class Context:
 
 
 @dataclass
+class CaseMatch:
+    case: CanonicalCase | None
+    confidence: float
+    method: str
+    candidates: tuple[tuple[str, float], ...] = ()
+    notes: tuple[str, ...] = ()
+
+
+#: Below this, a cited name and a registry entry are treated as different
+#: cases. Deliberately low: reports abbreviate party names heavily ("R
+#: (UNISON) v Lord Chancellor" is listed as "R v Lord Chancellor").
+CASE_NAME_AGREES = 0.6
+
+
+@dataclass
 class Match:
     work: CanonicalWork | None
     confidence: float
@@ -101,6 +121,10 @@ class Resolver:
     ``accept`` is the fuzzy score at or above which a match is returned as
     resolved; ``suggest`` is the lower bar at or above which a near-miss is
     still reported in ``candidates`` but left unresolved.
+
+    Case citations are resolved against ``case_registry`` (the seed case
+    registry by default). Pass ``link_cases=False`` to skip case law
+    entirely, which restores the legislation-only behaviour.
     """
 
     def __init__(
@@ -111,18 +135,36 @@ class Resolver:
         suggest: float = 0.60,
         remote=None,
         default_version: Version | None = None,
+        case_registry: CaseRegistry | None = None,
+        link_cases: bool = True,
     ) -> None:
         self.registry = registry if registry is not None else Registry.default()
         self.accept = accept
         self.suggest = suggest
         self.remote = remote
         self.default_version = default_version or Version()
+        self.link_cases = link_cases
+        self.cases = (
+            case_registry if case_registry is not None
+            else CaseRegistry.default() if link_cases else CaseRegistry()
+        )
 
     # -- entry points ------------------------------------------------------
 
     def resolve_document(self, text: str, version: Version | None = None) -> DocumentResult:
-        """Extract and resolve every citation in ``text``."""
-        raw_citations, definitions = extract(text, self.registry.alias_keys())
+        """Extract and resolve every citation in ``text``.
+
+        Case citations are found first, and their spans are withheld from
+        legislation extraction: "[1996] Ch 1" is a law report, not Chapter 1.
+        """
+        cases: list[CaseCitation] = []
+        if self.link_cases:
+            mentions = find_cases(text, self.cases.name_keys())
+            cases = [self._resolve_case(text, m) for m in mentions]
+
+        raw_citations, definitions = extract(
+            text, self.registry.alias_keys(), exclude=[(c.start, c.end) for c in cases]
+        )
         context = Context()
         self._seed_short_forms(definitions, context)
         effective_version = version or self.default_version
@@ -130,7 +172,7 @@ class Resolver:
         citations: list[Citation] = []
         for raw in raw_citations:
             citations.append(self._resolve_citation(text, raw, context, effective_version))
-        return DocumentResult(text=text, citations=citations)
+        return DocumentResult(text=text, citations=citations, cases=cases)
 
     def resolve_text(self, text: str, version: Version | None = None) -> DocumentResult:
         """Alias for :meth:`resolve_document`, for short fragments."""
@@ -145,6 +187,10 @@ class Resolver:
         return self._match(
             WorkRef(surface=title, title=title, year=year, number=number), Context()
         )
+
+    def resolve_case(self, ref: CaseRef) -> CaseMatch:
+        """Resolve a single case reference outside any document."""
+        return self._match_case(ref)
 
     # -- internals ---------------------------------------------------------
 
@@ -315,6 +361,155 @@ class Resolver:
         return Match(None, 0.0, "unresolved", notes=("back-reference with no antecedent",))
 
     def _title_score(self, title: str, work: CanonicalWork) -> float:
-        from .normalize import similarity
-
         return similarity(normalize_title(title), normalize_title(work.title))
+
+    # -- case law ----------------------------------------------------------
+
+    def _resolve_case(self, text: str, mention: CaseMention) -> CaseCitation:
+        ref = mention.ref
+        match = self._match_case(ref)
+        notes = list(match.notes)
+
+        url, source = None, None
+        neutral = match.case.neutral if match.case else None
+        if neutral is not None:
+            url, source = judgment_url(neutral)
+            if url is None:
+                court = f"{neutral.court} ({neutral.division})" if neutral.division else neutral.court
+                notes.append(f"no direct link for {court}")
+                court_info = COURTS.get(neutral.court)
+                if not (court_info and court_info.tna):
+                    # Find Case Law does not hold this court; a search there
+                    # would be a link that cannot succeed.
+                    return self._case_citation(text, mention, match, notes, None, None)
+        if url is None:
+            query = (
+                match.case.neutral.text if match.case and match.case.neutral
+                else ref.name or (match.case.name if match.case else None)
+                or (ref.reports[0].text if ref.reports else ref.surface)
+            )
+            url, source = case_search_url(query), "search"
+
+        return self._case_citation(text, mention, match, notes, url, source)
+
+    @staticmethod
+    def _case_citation(
+        text: str, mention: CaseMention, match: CaseMatch, notes: list[str],
+        url: str | None, source: str | None,
+    ) -> CaseCitation:
+        return CaseCitation(
+            surface=text[mention.start: mention.end],
+            start=mention.start,
+            end=mention.end,
+            case_ref=mention.ref,
+            case=match.case,
+            confidence=match.confidence,
+            method=match.method,
+            candidates=match.candidates,
+            notes=tuple(notes),
+            url=url,
+            source=source,
+        )
+
+    def _match_case(self, ref: CaseRef) -> CaseMatch:
+        # 1. A neutral citation is decisive, registered or not.
+        if ref.neutral:
+            case = self.cases.by_neutral(ref.neutral)
+            if case:
+                notes = ()
+                if ref.name and self._case_name_score(ref.name, case) < CASE_NAME_AGREES:
+                    notes = (f"cited name differs from the registry entry ({case.name})",)
+                return CaseMatch(case, 1.0, "neutral", notes=notes)
+            synthetic = CanonicalCase(
+                id=case_id(ref.neutral),
+                name=ref.name or ref.neutral.text,
+                neutral=ref.neutral,
+                reports=tuple(r.text for r in ref.reports),
+            )
+            return CaseMatch(synthetic, 0.95, "neutral",
+                             notes=("constructed from the neutral citation; not in registry",))
+
+        # 2. A law report citation, cross-checked against the cited name.
+        #    Report citations are not live-verifiable, and a mistyped page
+        #    number points at a different case, so a name that disagrees
+        #    blocks the match rather than being overridden by it.
+        candidates: list[tuple[str, float]] = []
+        for report in ref.reports:
+            hits, loose = self.cases.by_report(report)
+            if len(hits) != 1:
+                candidates += [(c.id, 0.5) for c in hits]
+                continue
+            case = hits[0]
+            notes = ("matched ignoring the report volume",) if loose else ()
+            if ref.name is None:
+                return CaseMatch(case, 0.85 if not loose else 0.80, "report",
+                                 notes=notes + ("matched on the report citation alone",))
+            score = self._case_name_score(ref.name, case)
+            if score >= CASE_NAME_AGREES:
+                return CaseMatch(case, 0.95 if not loose else 0.90, "report", notes=notes)
+            return CaseMatch(None, 0.0, "unresolved", ((case.id, round(score, 4)),),
+                             (f"{report.text} is registered to {case.name}, "
+                              "but the cited name does not match",))
+
+        # 3. The name alone -- exact, then fuzzy. A name is weak evidence when
+        #    the text also cites a report the registry does not know ("R v
+        #    Brown" names dozens of cases), so the years must agree.
+        if ref.name:
+            years = {r.year for r in ref.reports}
+            hits = [c for c in self.cases.by_name(ref.name) if self._years_agree(c, years)]
+            if len(hits) == 1:
+                return CaseMatch(hits[0], 0.90, "name")
+            if len(hits) > 1:
+                return CaseMatch(None, 0.0, "unresolved", tuple((c.id, 1.0) for c in hits),
+                                 ("several registered cases share that name",))
+
+            scored = [
+                (c, s) for c, s in self.cases.search(ref.name, cutoff=self.suggest)
+                if self._years_agree(c, years)
+            ]
+            candidates += [(c.id, s) for c, s in scored]
+            if scored and scored[0][1] >= self.accept:
+                return CaseMatch(scored[0][0], scored[0][1], "fuzzy", tuple(candidates))
+
+        return CaseMatch(None, 0.0, "unresolved", tuple(candidates),
+                         ("no neutral citation, and no registry entry matched",))
+
+    @staticmethod
+    def _years_agree(case: CanonicalCase, years: set[int]) -> bool:
+        """Could a report from one of ``years`` be a report of ``case``?
+
+        Reports often appear a year after judgment ("[2019] UKSC 41" is
+        reported at "[2020] AC 373"), so a one-year lag is allowed.
+        """
+        if not years or case.year is None:
+            return True
+        return any(case.year <= y <= case.year + 1 for y in years)
+
+    @staticmethod
+    def _case_name_score(name: str, case: CanonicalCase) -> float:
+        """How well a cited name agrees with a registered case, in [0, 1]."""
+        probe = normalize_case_name(name)
+        return max(_name_agreement(probe, normalize_case_name(n)) for n in (case.name, *case.aliases))
+
+
+def _name_agreement(a: str, b: str) -> float:
+    """Compare two normalised case names party by party.
+
+    Whole-string similarity is too forgiving here: "lachaux v smith" and
+    "lachaux v independent print" share a claimant and score well, yet name
+    different cases. Each side must agree on its own, and the weaker side
+    decides. A side agrees fully when one is a subset of the other, which is
+    how reports abbreviate names ("r v lord chancellor" for "r unison v lord
+    chancellor").
+    """
+    sides_a, sides_b = a.split(" v "), b.split(" v ")
+    if len(sides_a) != 2 or len(sides_b) != 2:
+        return similarity(a, b)
+    return min(_party_agreement(x, y) for x, y in zip(sides_a, sides_b))
+
+
+def _party_agreement(a: str, b: str) -> float:
+    ta, tb = set(a.split()), set(b.split())
+    if ta and tb and (ta <= tb or tb <= ta):
+        return 1.0
+    return similarity(a, b)

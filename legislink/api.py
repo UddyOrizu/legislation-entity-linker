@@ -56,7 +56,10 @@ def create_app(resolver: Resolver | None = None) -> FastAPI:
     app = FastAPI(
         title="legislink",
         version=__version__,
-        description="Extract, resolve and link UK legislation citations to legislation.gov.uk.",
+        description=(
+            "Extract, resolve and link UK legislation citations to legislation.gov.uk, "
+            "and case citations to Find Case Law."
+        ),
     )
     app.state.resolver = resolver
 
@@ -66,6 +69,8 @@ def create_app(resolver: Resolver | None = None) -> FastAPI:
             "status": "ok",
             "version": __version__,
             "registry_size": len(app.state.resolver.registry),
+            "case_registry_size": len(app.state.resolver.cases),
+            "case_linking": app.state.resolver.link_cases,
             "fuzzy_backend": FUZZY_BACKEND,
             "remote_lookups": app.state.resolver.remote is not None,
         }
@@ -103,6 +108,27 @@ def create_app(resolver: Resolver | None = None) -> FastAPI:
         found = [w for w in registry if year is None or w.year == year]
         found.sort(key=lambda w: (w.year, w.title))
         return {"total": len(found), "results": [w.to_dict() for w in found[:limit]]}
+
+    @app.get("/cases", summary="List or search the case registry")
+    def cases(
+        q: str | None = Query(None, description="Fuzzy case-name search."),
+        limit: int = Query(20, ge=1, le=200),
+    ) -> dict[str, Any]:
+        registry = app.state.resolver.cases
+        if q:
+            hits = registry.search(q, limit=limit, cutoff=0.3)
+            return {"query": q, "results": [
+                {**c.to_dict(), "score": round(s, 4)} for c, s in hits
+            ]}
+        found = sorted(registry, key=lambda c: (c.year or 0, c.name))
+        return {"total": len(found), "results": [c.to_dict() for c in found[:limit]]}
+
+    @app.get("/cases/{case_id}", summary="Fetch one case by id")
+    def case(case_id: str) -> dict[str, Any]:
+        found = app.state.resolver.cases.get(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail=f"no such case: {case_id}")
+        return found.to_dict()
 
     @app.get("/works/{work_id}", summary="Fetch one work by id")
     def work(work_id: str) -> dict[str, Any]:

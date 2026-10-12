@@ -1,7 +1,9 @@
 # legislink
 
-Extract UK legislation citations from text, resolve them to the actual piece of
-legislation, and link them to [legislation.gov.uk](https://www.legislation.gov.uk).
+Extract UK legislation and case citations from text, resolve them to the
+actual piece of legislation or judgment, and link them to
+[legislation.gov.uk](https://www.legislation.gov.uk) and
+[Find Case Law](https://caselaw.nationalarchives.gov.uk).
 
 ```python
 from legislink import resolve_text
@@ -13,6 +15,13 @@ c.work.citation   # 'Human Rights Act 1998 (c. 42)'
 c.url             # 'https://www.legislation.gov.uk/ukpga/1998/42/section/6'
 c.confidence      # 1.0
 c.method          # 'exact'
+
+result = resolve_text("Applying Patel v Mirza [2017] AC 467 at [120], the defence fails.")
+case = result.cases[0]
+
+case.case.citation  # 'Patel v Mirza [2016] UKSC 42, [2017] AC 467'
+case.url            # 'https://caselaw.nationalarchives.gov.uk/uksc/2016/42'
+case.method         # 'report'
 ```
 
 The three jobs in the name are three separate passes, and each is usable on its
@@ -21,8 +30,14 @@ own:
 | Pass | Module | Job |
 |---|---|---|
 | **Extract** | `legislink.extract` | Find citations in prose, with character offsets |
-| **Resolve** | `legislink.resolve` | Decide *which* piece of legislation each one means |
-| **Link** | `legislink.link` | Build the legislation.gov.uk URL and identifier |
+| **Resolve** | `legislink.resolve` | Decide *which* piece of legislation or judgment each one means |
+| **Link** | `legislink.link`, `legislink.courts` | Build the legislation.gov.uk or Find Case Law URL |
+
+Legislation citations are reported in `result.citations` and case citations in
+`result.cases`. They never overlap: cases are found first, and their spans are
+withheld from legislation matching, so the law report `[1996] Ch 1` is not
+mistaken for "Chapter 1" and a judgment's "at para 45" is not read as a
+paragraph of legislation.
 
 ## Install
 
@@ -57,6 +72,20 @@ the DPA  ("...Act 2018 ('the DPA')")           document-defined short forms
 TUPE, PACE, COSHH                              registry-registered acronyms
 ```
 
+Case law:
+
+```
+[2019] UKSC 41                                 neutral citation
+[2019] EWHC 123 (Ch) / [2026] EWCOP 52 (T2)    with division or tier
+[2020] AC 373 / [2004] 2 AC 557                law reports, optional volume
+(2002) 35 EHRR 1                               round-bracket reports
+Uber BV v Aslam [2021] UKSC 5, [2021] ICR 657  name + parallel citations
+R (Miller) v Prime Minister / Re B (A Child)   judicial review and "Re" names
+R v SSHD, ex p. Brind [1991] 1 AC 696          ex parte names
+... at [87] / at paras 45-48 / at 567B         pinpoints
+Patel v Mirza                                  a registered case named alone
+```
+
 Offsets always index the original string, so you can highlight or rewrite the
 source document without re-aligning anything.
 
@@ -73,6 +102,8 @@ legislink resolve --original "section 2 of the European Communities Act 1972"
 legislink annotate judgment.txt --html > judgment.html
 legislink index corpus/ -o citation-index.json
 legislink works --search "data protection"
+legislink cases --search "miller"
+legislink resolve --cases my-cases.json --file judgment.txt
 legislink serve --port 8000
 ```
 
@@ -86,6 +117,8 @@ Common CLI options:
 | `--html` | Emit HTML links from `annotate` instead of Markdown links |
 | `--min-confidence SCORE` | Leave weaker matches unlinked when annotating |
 | `-r, --registry FILE` | Load an additional registry JSON file; repeatable |
+| `--cases FILE` | Load an additional case registry JSON file; repeatable |
+| `--no-cases` | Ignore case citations (legislation only) |
 | `--remote` | Search legislation.gov.uk for unknown titles |
 | `--accept SCORE` | Fuzzy score required for a resolved match |
 | `--suggest SCORE` | Lower fuzzy score for reporting candidates |
@@ -103,21 +136,26 @@ legislink index judgments/ -o citation-index.json
 legislink resolve --remote "the Agriculture Act 2020"
 ```
 
-`resolve` prints a table by default:
+`resolve` prints a table by default, with a second table for case law when
+the text cites any:
 
 ```
-CONF  METHOD  CITATION                                RESOLVED AS                 URL
-----  ------  --------------------------------------  --------------------------  ---
+CONF  METHOD  CITATION                                RESOLVED AS                    URL
+----  ------  --------------------------------------  -----------------------------  ---
 1.00  exact   section 6 of the Human Rights Act 1998  Human Rights Act 1998 (c. 42)  https://…/ukpga/1998/42/section/6
+
+CONF  METHOD  CASE                                    RESOLVED AS                    URL
+----  ------  --------------------------------------  -----------------------------  ---
+1.00  neutral Patel v Mirza [2016] UKSC 42            Patel v Mirza [2016] UKSC 42…  https://…/uksc/2016/42
 ```
 
 `index` walks a corpus and inverts it into a citator: which documents cite this
-Act, and at what pinpoint.
+Act or this case, and at what pinpoint.
 
 ### Version selection
 
 Version selection is a global per-call override. It does not try to infer a
-date from phrases in the source document.
+date from phrases in the source document, and it applies to legislation only.
 
 | Option | URL view |
 |---|---|
@@ -167,16 +205,20 @@ Search the registry and inspect service health:
 ```bash
 curl 'http://127.0.0.1:8000/works?q=data%20protection&year=2018'
 curl http://127.0.0.1:8000/works/ukpga-1998-42
+curl 'http://127.0.0.1:8000/cases?q=miller'
+curl http://127.0.0.1:8000/cases/uksc-2019-41
 curl http://127.0.0.1:8000/health
 ```
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /resolve` | `{"text": "...", "version": "as-at:1991-02-01"}` → citations, works, stats |
+| `POST /resolve` | `{"text": "...", "version": "as-at:1991-02-01"}` → citations, works, cases, stats |
 | `POST /annotate` | `{"text": "...", "format": "html", "version": "original"}` → linked text |
 | `GET /works?q=…&year=…` | Search the registry |
 | `GET /works/{id}` | One work |
-| `GET /health` | Registry size, fuzzy backend, remote on/off |
+| `GET /cases?q=…` | Search the case registry |
+| `GET /cases/{id}` | One case |
+| `GET /health` | Registry sizes, fuzzy backend, remote on/off |
 
 The API accepts `latest`, `original`, `prospective`, or
 `as-at:YYYY-MM-DD` as the `version` value. Omitting it preserves the default
@@ -200,7 +242,16 @@ for citation in result.citations:
   print(citation.url)
 ```
 
-Use `to_dict()` for JSON-compatible output:
+Case citations are in `result.cases`:
+
+```python
+for case in result.cases:
+  print(case.case.citation if case.case else "unresolved", case.url)
+```
+
+Use `to_dict()` for JSON-compatible output. Its `cases` list holds every case
+citation, `case_law` holds the distinct resolved cases, and `stats` gains
+`case_citations`, `cases_resolved` and `distinct_cases`:
 
 ```python
 payload = result.to_dict(include_text=True)
@@ -220,6 +271,18 @@ resolver = Resolver(
   suggest=0.65,
 )
 result = resolve_text("the Fictional Widgets Act 1911", resolver=resolver)
+```
+
+The resolver loads the seed case registry too. Pass your own with
+`case_registry=`, or turn case law off with `link_cases=False`:
+
+```python
+from legislink import CaseRegistry, Resolver
+
+cases = CaseRegistry.default()
+cases.load_file("my-cases.json")
+resolver = Resolver(Registry.default(), case_registry=cases)
+legislation_only = Resolver(Registry.default(), link_cases=False)
 ```
 
 Enable optional live lookups explicitly:
@@ -289,6 +352,41 @@ Unresolved citations still get a `url` — a legislation.gov.uk search — but
 `work` is `None` and `id_uri` is `None`, so resolved and unresolved are never
 confusable.
 
+### Case citations
+
+| `method` | Confidence | Basis |
+|---|---|---|
+| `neutral` | 1.00 | A neutral citation found in the case registry |
+| `neutral` | 0.95 | A neutral citation not in the registry; the link is built from it |
+| `report` | 0.90 – 0.95 | A law report citation in the registry, and the cited name agrees |
+| `report` | 0.80 – 0.85 | A registered report citation with no name beside it |
+| `name` | 0.90 | A registered case name, exactly |
+| `fuzzy` | ≥ `accept` | A registered case name, approximately |
+| `unresolved` | 0.0 | Nothing cleared the bar; `url` is a Find Case Law search |
+
+The same rules apply as for legislation:
+
+- **A neutral citation always wins.** `[2020] EWCA Civ 1` identifies one
+  judgment, so it is linked even when nobody registered the case.
+- **A report citation does not override a conflicting name.** Report
+  citations can't be checked against a free authoritative source, and a
+  mistyped page number points at a different case. So `Lachaux v Smith [2020]
+  AC 612` is left unresolved, with *Lachaux v Independent Print* as a
+  candidate, rather than linked to the case that really is at that page. Names
+  are compared party by party, and an abbreviated party still agrees ("R v Lord
+  Chancellor" matches "R (UNISON) v Lord Chancellor").
+- **A name alone needs agreeing years.** "R v Brown" names dozens of cases, so
+  a name match is only accepted when any report cited beside it is from the
+  judgment's year or the year after.
+- **A bare "X v Y" is only a citation when it is registered.** Otherwise every
+  "Brexit v Remain" in prose would be reported.
+
+A resolved case has `case` set. An unresolved one has `case = None` and a
+Find Case Law search `url`. A case from a court whose URL shape is not known
+(for example `NIQB`) is resolved, but its `url` is `None` and a note says so.
+`case_ref.pinpoint` records "at [87]"-style pinpoints. They are not added to
+the URL, because the judgment page is the addressable unit.
+
 ## URLs and identifiers
 
 Each citation carries two links:
@@ -316,6 +414,32 @@ result = resolve_text(
 result.citations[0].url
 # https://www.legislation.gov.uk/ukpga/1972/68/section/2/1991-02-01
 ```
+
+### Case law links
+
+Neutral citations are linked to [Find Case Law](https://caselaw.nationalarchives.gov.uk)
+(The National Archives), which is the official home of judgments in England
+and Wales and the UK courts:
+
+```
+[2019] UKSC 41        https://caselaw.nationalarchives.gov.uk/uksc/2019/41
+[2019] EWHC 1 (Ch)    https://caselaw.nationalarchives.gov.uk/ewhc/ch/2019/1
+[2026] EWCOP 52 (T2)  https://caselaw.nationalarchives.gov.uk/ewcop/t2/2026/52
+```
+
+Every Find Case Law path shape was checked against the live service. Its
+coverage is incomplete, though: for example, *Ivey v Genting* [2017] UKSC 67
+is not there. So a correctly built link can still 404 for an individual
+judgment.
+
+[BAILII](https://www.bailii.org) is used only where Find Case Law has nothing:
+the House of Lords, the Court of Session and High Court of Justiciary, the
+Northern Ireland Court of Appeal, the old `UKEAT` numbering, and BAILII's
+retrospective neutral citations for pre-2001 judgments (`[1932] UKHL 100`).
+BAILII refuses automated requests, so **those URL shapes are not
+live-verified**.
+
+### Legislation paths
 
 Only Schedules contribute a path prefix. A Part or Chapter is dropped when
 something more specific is cited, because legislation.gov.uk itself redirects
@@ -361,6 +485,34 @@ python scripts/verify_registry.py              # the seed registry
 python scripts/verify_registry.py my-works.json
 ```
 
+### Extending the case registry
+
+The shipped case registry is a small seed of ten Supreme Court judgments.
+Each neutral citation in it was verified against Find Case Law, and the page
+title was checked against the registered name. Add your own cases in the same
+way as legislation:
+
+```bash
+export LEGISLINK_CASES=/path/to/my-cases.json   # colon-separated
+legislink resolve --cases my-cases.json "Donoghue v Stevenson [1932] AC 562"
+```
+
+```json
+{"cases": [
+  {"name": "Donoghue v Stevenson", "neutral": "[1932] UKHL 100",
+   "reports": ["[1932] AC 562"], "aliases": []}
+]}
+```
+
+`neutral` is what produces the link. `reports` and `name`/`aliases` let a case
+be recognised when the text cites it by report or by name alone. Verify a case
+file against Find Case Law with:
+
+```bash
+python scripts/verify_cases.py                 # the seed case registry
+python scripts/verify_cases.py my-cases.json   # BAILII-linked entries are skipped
+```
+
 ### Live lookups
 
 Off by default. When on, an unresolved title is searched on legislation.gov.uk
@@ -391,7 +543,16 @@ min_confidence=0.9)` leaves weaker citations as plain text.
   point-in-time dates select a legislation.gov.uk URL view; in-text dates are
   not detected, and amendments, repeals, commencement, and legal effect are
   not independently modelled.
-- **No case citations.** `Smith v Jones [2019] UKSC 1` is deliberately ignored.
+- **Case law is UK-only and link-first.** Neutral citations link directly.
+  Report-only and name-only citations resolve only against the case registry,
+  which is small, so most of them resolve to a search link until you extend
+  it. There is no remote case lookup.
+- **No case short forms.** A later "in *Montgomery*" or "the *Miller* case" is
+  not linked back to an earlier full citation.
+- **Case names are heuristic.** A name is read back from its citation to the
+  start of the sentence. Lists such as "Smith and Jones v Brown" can pull in
+  too much, and a citation with no adjacent name is still linked by its
+  citation alone.
 - **Fuzzy matching is bounded by the registry.** A work that is neither
   registered nor cited with its number stays unresolved unless `--remote` is on.
 - The seed registry's chapter numbers were verified against legislation.gov.uk,
@@ -401,14 +562,14 @@ min_confidence=0.9)` leaves weaker citations as plain text.
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 144 tests, no network required
+pytest                    # 209 tests, no network required
 ```
 
-The test suite is offline; only `scripts/verify_registry.py` touches the
-network. There is a sample document to try things on:
+The test suite is offline; only `scripts/verify_registry.py` and
+`scripts/verify_cases.py` touch the network. There is a sample document to try things on:
 
 ```bash
-legislink resolve examples/tribunal-judgment.txt     # 21/21 resolved
+legislink resolve examples/tribunal-judgment.txt     # 21/21 legislation, 5/6 cases
 legislink annotate examples/tribunal-judgment.txt
 ```
 
@@ -417,14 +578,16 @@ legislink/
   patterns.py    the UK citation grammar (all regexes live here)
   extract.py     pass 1 — find citations, bind pinpoints to works
   registry.py    canonical works and their lookup indexes
-  resolve.py     pass 2 — match references to works, resolve anaphora
-  link.py        pass 3 — build URLs and identifiers
+  cases.py       the case registry and its lookup indexes
+  resolve.py     pass 2 — match references to works and cases
+  link.py        pass 3 — build legislation URLs and identifiers
+  courts.py      pass 3 — the court table; neutral citation → judgment URL
   pipeline.py    resolve / annotate / index a corpus
   normalize.py   title normalisation and similarity
   remote.py      optional legislation.gov.uk client
   cli.py  api.py interfaces
-  data/works.json
-scripts/verify_registry.py
+  data/works.json  data/cases.json
+scripts/verify_registry.py  scripts/verify_cases.py
 examples/tribunal-judgment.txt
 tests/
 ```

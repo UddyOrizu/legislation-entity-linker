@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "legislink"
 version = "0.1.0"
-description = "Extract, resolve and link UK legislation citations to legislation.gov.uk"
+description = "Extract, resolve and link UK legislation and case citations to legislation.gov.uk and Find Case Law"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

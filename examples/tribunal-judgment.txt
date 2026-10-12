@@ -25,3 +25,11 @@ BETWEEN: A Claimant and B Respondent
 
 6. Finally, the claimant relies on the Public Interest Disclosure Act 1998,
    ss 1-3, and on the Protection from Harassment Act 1997.
+
+7. On employment status the tribunal follows Uber BV v Aslam [2021] UKSC 5,
+   [2021] ICR 657 at [87], and Pimlico Plumbers Ltd v Smith [2018] UKSC 29.
+   The respondent's reliance on Smith v Jones [1996] Ch 1, at para 45, is
+   misplaced, as is its reading of Essop v Home Office [2017] 1 WLR 1343.
+
+8. Any illegality defence falls to be decided under Patel v Mirza, and the
+   tribunal notes the comments of the High Court in [2019] EWHC 1 (Ch).

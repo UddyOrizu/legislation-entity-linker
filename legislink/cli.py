@@ -5,6 +5,7 @@
     legislink annotate judgment.txt --html > judgment.html
     legislink index corpus/ -o index.json
     legislink works --search "data protection"
+    legislink cases --search "miller"
     legislink serve --port 8000
 """
 
@@ -15,6 +16,7 @@ import json
 import sys
 from pathlib import Path
 
+from .cases import CaseRegistry
 from .models import DocumentResult, Version
 from .normalize import FUZZY_BACKEND
 from .pipeline import annotate, build_index, resolve_text
@@ -42,12 +44,21 @@ def _build_resolver(args: argparse.Namespace) -> Resolver:
 
         remote = LegislationGovUk()
 
+    link_cases = not getattr(args, "no_cases", False)
+    case_registry = None
+    if link_cases:
+        case_registry = CaseRegistry.default()
+        for path in getattr(args, "cases", None) or []:
+            case_registry.load_file(path)
+
     return Resolver(
         registry,
         accept=getattr(args, "accept", 0.86),
         suggest=getattr(args, "suggest", 0.60),
         remote=remote,
         default_version=version,
+        case_registry=case_registry,
+        link_cases=link_cases,
     )
 
 
@@ -62,7 +73,7 @@ def _read_input(args: argparse.Namespace) -> str:
         return Path(args.file).read_text(encoding="utf-8", errors="replace")
     if args.text:
         paths = [Path(t) for t in args.text]
-        if all(p.is_file() for p in paths):
+        if all(_is_file(p) for p in paths):
             return "\n\n".join(
                 p.read_text(encoding="utf-8", errors="replace") for p in paths
             )
@@ -70,6 +81,13 @@ def _read_input(args: argparse.Namespace) -> str:
     if not sys.stdin.isatty():
         return sys.stdin.read()
     raise SystemExit("nothing to read: pass text, a file path, --file, or pipe stdin")
+
+
+def _is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:  # e.g. a long text argument exceeds the filename limit
+        return False
 
 
 def _print_table(result: DocumentResult) -> None:
@@ -84,17 +102,40 @@ def _print_table(result: DocumentResult) -> None:
                 c.url or "—",
             )
         )
+    if result.citations or not result.cases:
+        _print_rows(rows)
+    if result.cases:
+        if result.citations:
+            print()
+        _print_rows([("CONF", "METHOD", "CASE", "RESOLVED AS", "URL")] + [
+            (
+                f"{c.confidence:.2f}",
+                c.method,
+                " ".join(c.surface.split())[:44],
+                (c.case.citation if c.case else "—")[:46],
+                c.url or "—",
+            )
+            for c in result.cases
+        ])
+    s = result.to_dict()["stats"]
+    print(
+        f"\n{s['citations']} citations, {s['resolved']} resolved, "
+        f"{s['distinct_works']} distinct works"
+    )
+    if s["case_citations"]:
+        print(
+            f"{s['case_citations']} case citations, {s['cases_resolved']} resolved, "
+            f"{s['distinct_cases']} distinct cases"
+        )
+
+
+def _print_rows(rows: list[tuple[str, ...]]) -> None:
     widths = [max(len(r[i]) for r in rows) for i in range(4)]
     for i, row in enumerate(rows):
         line = "  ".join(row[j].ljust(widths[j]) for j in range(4)) + "  " + row[4]
         print(line)
         if i == 0:
             print("  ".join("-" * w for w in widths) + "  " + "-" * 3)
-    s = result.to_dict()["stats"]
-    print(
-        f"\n{s['citations']} citations, {s['resolved']} resolved, "
-        f"{s['distinct_works']} distinct works"
-    )
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -155,6 +196,22 @@ def cmd_works(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cases(args: argparse.Namespace) -> int:
+    registry = CaseRegistry.default()
+    for path in args.cases or []:
+        registry.load_file(path)
+
+    if args.search:
+        for case, score in registry.search(args.search, limit=args.limit, cutoff=0.3):
+            print(f"{score:.2f}  {case.id:<22}  {case.citation}")
+            print(f"{'':6}{'':22}  {case.url or '—'}")
+    else:
+        for case in sorted(registry, key=lambda c: (c.year or 0, c.name))[: args.limit]:
+            print(f"{case.id:<22}  {case.citation}")
+        print(f"\n{len(registry)} cases in registry")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     try:
         import uvicorn
@@ -169,7 +226,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="legislink",
-        description="Extract, resolve and link UK legislation citations.",
+        description="Extract, resolve and link UK legislation and case citations.",
     )
     parser.add_argument("--version", action="version", version=f"legislink {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -189,6 +246,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="fuzzy score at which a near-miss is reported")
         p.add_argument("--remote", action="store_true",
                        help="fall back to legislation.gov.uk for unknown titles")
+        p.add_argument("--cases", action="append", metavar="JSON",
+                       help="extra case registry file (repeatable)")
+        p.add_argument("--no-cases", action="store_true",
+                       help="ignore case citations; legislation only")
 
     def add_input_flags(p: argparse.ArgumentParser) -> None:
         p.add_argument("text", nargs="*", help="text to process, or a file path")
@@ -222,6 +283,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_works.add_argument("--limit", type=int, default=20)
     p_works.add_argument("-r", "--registry", action="append", metavar="JSON")
     p_works.set_defaults(func=cmd_works)
+
+    p_cases = sub.add_parser("cases", help="inspect the case registry")
+    p_cases.add_argument("--search", metavar="NAME", help="fuzzy-search case names")
+    p_cases.add_argument("--limit", type=int, default=20)
+    p_cases.add_argument("--cases", action="append", metavar="JSON")
+    p_cases.set_defaults(func=cmd_cases)
 
     p_serve = sub.add_parser("serve", help="run the REST API")
     p_serve.add_argument("--host", default="127.0.0.1")
